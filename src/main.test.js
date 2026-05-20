@@ -18,15 +18,25 @@ export const server = setupServer(
 
     const headers = request.headers;
     const range = headers.get('Range');
-    const [match, startStr, endStr] = range.match(/^bytes=(\d*)-(\d*)/);
+    const match = range && range.match(/^bytes=(\d*)-(\d*)/);
     if (match) {
-      const start = parseInt(startStr, 10);
-      const end = parseInt(endStr, 10) + 1; //Range requests are *inclusive*
+      const [, startStr, endStr] = match;
+      let start;
+      let end;
+      if (startStr === '' && endStr !== '') {
+        // Suffix range: bytes=-N → last N bytes of the file
+        const suffixLen = Math.min(parseInt(endStr, 10), localFile.size);
+        start = localFile.size - suffixLen;
+        end = localFile.size; // exclusive for our fetchRange helper
+      } else {
+        start = parseInt(startStr, 10);
+        end = parseInt(endStr, 10) + 1; // Range requests are *inclusive*
+      }
 
       const body = await localFile.fetchRange(start, end, undefined);
       return new HttpResponse(body, {
         status: 206,
-        headers: { 'Content-Range': `bytes ${startStr}-${endStr}/${localFile.size}` },
+        headers: { 'Content-Range': `bytes ${start}-${end - 1}/${localFile.size}` },
       });
     } else {
       return new HttpResponse(undefined, { status: 500 });

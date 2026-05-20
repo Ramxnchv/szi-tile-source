@@ -38,6 +38,11 @@ export const enableSziTileSource = (OpenSeadragon) => {
 
       const options = await this.readOptionsFromDziXml(remoteSziReader);
 
+      // Bootstrap (EOCD → Central Directory → .dzi) is done; the tail buffer prefetched
+      // by RemoteFile.create has served its purpose. Free it so we don't pin ~1 MB per
+      // SZI for the lifetime of the viewer when many tile sources are open in parallel.
+      remoteSziFile.releaseCache();
+
       return new SziTileSource(remoteSziReader, options);
     };
 

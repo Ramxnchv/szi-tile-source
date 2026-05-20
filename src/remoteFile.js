@@ -1,72 +1,96 @@
 /**
+ * Default size (bytes) of the tail prefetched on `RemoteFile.create`.
+ * Picked to cover EOCD + Zip64 records + Central Directory + the .dzi for typical SZIs,
+ * so the whole bootstrap (size discovery, ZIP TOC, DZI options) resolves in 1 round-trip.
+ */
+const DEFAULT_INITIAL_TAIL_SIZE = 1024 * 1024;
+
+/**
  * Represents a remote file that we are going to try and read from
  */
 export class RemoteFile {
   /**
-   * Create the remote file by fetching its size using a head request
+   * Create the remote file. By default, a single suffix-range request is issued to discover
+   * the file size *and* prefetch the tail of the file in one round-trip. The prefetched bytes
+   * are kept in memory and reused by `fetchRange` whenever the requested range falls within
+   * them, so SZI bootstrap (EOCD + Central Directory + .dzi) typically completes with no
+   * additional HTTP requests.
    *
    * @param {string} url url of the file that we eventually want to read
-   * @param fetchOptions options to apply to all fetches,
+   * @param {Object} fetchOptions options to apply to all fetches
    * @param {string} fetchOptions.mode cors mode to use
    * @param {string} fetchOptions.credentials whether to send credentials
    * @param {Object} fetchOptions.headers additional headers to add to all requests
+   * @param {Object} [options]
+   * @param {number} [options.initialTailSize=1048576] bytes to prefetch from the end of the file
    * @returns {Promise<RemoteFile>}
    */
-  static create = async (url, fetchOptions) => {
-    const size = await this.fetchFileSize(url, fetchOptions);
-    return new RemoteFile(url, size, fetchOptions);
+  static create = async (url, fetchOptions = {}, options = {}) => {
+    const initialTailSize = options.initialTailSize ?? DEFAULT_INITIAL_TAIL_SIZE;
+    const { size, tailBuffer, tailStart } = await this.fetchSuffix(url, fetchOptions, initialTailSize);
+    return new RemoteFile(url, size, fetchOptions, { tailBuffer, tailStart });
   };
 
   /**
-   * Attempt to fetch the size of the remote file by doing a minimal ranged GET request and reading
-   * the Content-Range header
+   * Issue a suffix-range request (`Range: bytes=-N`) and parse the Content-Range header to
+   * recover both the total file size and where the returned chunk starts inside the file.
+   * If the file is smaller than `tailSize`, the server returns the entire file.
    *
    * @param {string} url
-   * @param fetchOptions options to apply to all fetches,
-   * @param {string} fetchOptions.mode cors mode to use
-   * @param {string} fetchOptions.credentials whether to send credentials
-   * @param {Object} fetchOptions.headers additional headers to add to all requests
-   * @returns {Promise<number>}
+   * @param {Object} fetchOptions same shape as `create`
+   * @param {number} tailSize bytes to request from the end of the file
+   * @returns {Promise<{size: number, tailBuffer: ArrayBuffer, tailStart: number}>}
    */
-  static fetchFileSize = async (url, fetchOptions) => {
-    const headers = fetchOptions.headers ? { ...fetchOptions.headers, Range: 'bytes=0-255' } : { Range: 'bytes=0-255' };
+  static fetchSuffix = async (url, fetchOptions, tailSize) => {
+    const headers = fetchOptions.headers
+      ? { ...fetchOptions.headers, Range: `bytes=-${tailSize}` }
+      : { Range: `bytes=-${tailSize}` };
 
     const response = await fetch(url, {
-      headers: headers,
+      headers,
       mode: fetchOptions.mode,
       credentials: fetchOptions.credentials,
     });
 
     if (!response.ok) {
-      throw new Error(`Could not fetch size of ${url}, response status for request: ${response.status}`);
+      throw new Error(`Could not fetch tail of ${url}, response status: ${response.status}`);
     }
 
     const contentRange = response.headers.get('Content-Range');
     if (!contentRange) {
       throw new Error(
-        `Could not fetch size of ${url}, Content-Range header not included in response. ` +
+        `Could not determine size of ${url}, Content-Range header not included in response. ` +
           "Check that your server's CORS settings include it in Access-Control-Expose-Headers.",
       );
     }
 
-    const [match, start, end, length] = contentRange.match(/bytes (\d+)\-(\d+)\/(\d+)/);
-    if (!match || !length) {
-      throw new Error(`Could not fetch size of ${url}, Content-Range header didn't contain the length of the file`);
+    const match = contentRange.match(/bytes (\d+)-(\d+)\/(\d+)/);
+    if (!match) {
+      throw new Error(`Could not parse Content-Range header (${contentRange}) for ${url}`);
     }
 
-    return parseInt(length, 10);
+    const tailStart = parseInt(match[1], 10);
+    const size = parseInt(match[3], 10);
+    const tailBuffer = await response.arrayBuffer();
+
+    return { size, tailBuffer, tailStart };
   };
 
-  constructor(url, size, fetchOptions) {
+  constructor(url, size, fetchOptions, cache = {}) {
     this.url = url;
     this.size = size;
     this.fetchOptions = fetchOptions;
+    this._cachedTail = cache.tailBuffer ?? null;
+    this._cachedTailStart = cache.tailStart ?? null;
   }
 
   /**
    * Fetch the range of bytes specified. Note that end is *exclusive*, though the header
    * expects *inclusive* values. This removes the need to continually subtract 1 from
    * the more usual end-exclusive values used elsewhere.
+   *
+   * If the requested range falls entirely within the cached tail prefetched at construction
+   * time, it is served from memory without issuing an HTTP request.
    *
    * @param {number} start inclusive start of range to fetch
    * @param {number} end exclusive start of range to fetch
@@ -89,6 +113,15 @@ export class RemoteFile {
       throw new Error(`Start of fetch range (${start}) greater than end (${end})!`);
     }
 
+    if (
+      this._cachedTail !== null &&
+      start >= this._cachedTailStart &&
+      end <= this._cachedTailStart + this._cachedTail.byteLength
+    ) {
+      const offset = start - this._cachedTailStart;
+      return this._cachedTail.slice(offset, offset + (end - start));
+    }
+
     const rangeHeaderValue = `bytes=${start}-${end - 1}`;
     const headers = this.fetchOptions.headers
       ? { ...this.fetchOptions.headers, Range: rangeHeaderValue }
@@ -106,5 +139,15 @@ export class RemoteFile {
     }
 
     return await response.arrayBuffer();
+  };
+
+  /**
+   * Release the in-memory tail prefetched at construction time. Call once bootstrap is done
+   * and tile fetching is about to start, so the prefetch cache doesn't stay pinned for the
+   * lifetime of the viewer (relevant when many SZIs are opened in parallel).
+   */
+  releaseCache = () => {
+    this._cachedTail = null;
+    this._cachedTailStart = null;
   };
 }

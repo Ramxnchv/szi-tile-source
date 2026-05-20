@@ -1,6 +1,6 @@
 {
-  "name": "szi-tile-source",
-  "version": "0.7.2",
+  "name": "@ramxnchv/szi-tile-source",
+  "version": "0.7.3",
   "description": "An OpenSeadragon TileSource for remotely hosted SZI files",
   "type": "module",
   "files": [
@@ -20,13 +20,15 @@
     "build_site": "vite build --config pages.config.js",
     "preview": "vite preview",
     "test": "vitest",
-    "prepare": "vite build"
+    "prepublishOnly": "vite build"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/sundogbio/szi-tile-source.git"
+    "url": "https://github.com/Ramxnchv/szi-tile-source.git"
   },
-  "private": true,
+  "publishConfig": {
+    "access": "public"
+  },
   "devDependencies": {
     "fast-xml-parser": "^5.2.5",
     "jsdom": "^26.1.0",

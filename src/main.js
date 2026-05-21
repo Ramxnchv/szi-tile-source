@@ -1,5 +1,6 @@
 import { RemoteFile } from './remoteFile.js';
 import { SziFileReader } from './sziFileReader.js';
+import { resolveLogger } from './logger.js';
 
 export const enableSziTileSource = (OpenSeadragon) => {
   /**
@@ -26,16 +27,28 @@ export const enableSziTileSource = (OpenSeadragon) => {
      * @param fetchOptions.credentials when and how to pass credentials
      *        (see:https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch#including_credentials)
      * @param fetchOptions.headers additional HTTP headers to send with each request
+     * @param {Object} [loggingOptions] optional logging configuration
+     * @param {('silent'|'info'|'debug')} [loggingOptions.logLevel='silent']
+     *        'silent' (default) — no console output, same as before.
+     *        'info'   — bootstrap milestones (tail prefetch, central directory parsed, DZI metadata).
+     *        'debug'  — every range request and tile download with size + timings.
+     * @param {string} [loggingOptions.logLabel] short label prefixed to every log line; defaults to the SZI filename.
+     * @param {Object} [loggingOptions.logger] pre-built logger object ({info, debug, warn}) to use instead of the level/label.
      * @returns {Promise<SziTileSource>}
      */
-    static createSziTileSource = async (url, fetchOptions = {}) => {
+    static createSziTileSource = async (url, fetchOptions = {}, loggingOptions = {}) => {
       if (fetchOptions && fetchOptions.mode === 'no-cors') {
         throw new Error("'no-cors' mode is not supported, as Range headers don't work with it");
       }
 
-      const remoteSziFile = await RemoteFile.create(url, fetchOptions);
-      const remoteSziReader = await SziFileReader.create(remoteSziFile);
+      const logger = resolveLogger(loggingOptions.logger ?? loggingOptions, url);
+      logger.info('reading SZI bootstrap…');
+      const bootstrapStart = performance.now();
 
+      const remoteSziFile = await RemoteFile.create(url, fetchOptions, { logger });
+      const remoteSziReader = await SziFileReader.create(remoteSziFile, { logger });
+
+      logger.info(`reading DZI descriptor: ${remoteSziReader.dziFilename()}`);
       const options = await this.readOptionsFromDziXml(remoteSziReader);
 
       // Bootstrap (EOCD → Central Directory → .dzi) is done; the tail buffer prefetched
@@ -43,7 +56,11 @@ export const enableSziTileSource = (OpenSeadragon) => {
       // SZI for the lifetime of the viewer when many tile sources are open in parallel.
       remoteSziFile.releaseCache();
 
-      return new SziTileSource(remoteSziReader, options);
+      const tileSource = new SziTileSource(remoteSziReader, options, logger);
+      logger.info(
+        `DZI ready: ${options.width}×${options.height}, tileSize=${options.tileSize}, maxLevel=${tileSource.maxLevel} | bootstrap ${(performance.now() - bootstrapStart).toFixed(0)} ms`,
+      );
+      return tileSource;
     };
 
     static async readOptionsFromDziXml(remoteSziReader) {
@@ -59,10 +76,12 @@ export const enableSziTileSource = (OpenSeadragon) => {
      *
      * @param remoteSziReader
      * @param options
+     * @param logger optional leveled logger built by createSziTileSource
      */
-    constructor(remoteSziReader, options) {
+    constructor(remoteSziReader, options, logger = null) {
       super(options);
       this.remoteSziReader = remoteSziReader;
+      this._logger = logger;
     }
 
     /**
@@ -97,6 +116,13 @@ export const enableSziTileSource = (OpenSeadragon) => {
       context.userData.image = image;
       context.userData.abortController = new AbortController();
 
+      // Extract pyramid level from the SZI-internal path: "<name>_files/<level>/<col>_<row>.<ext>".
+      // Falls back to '?' when the path doesn't match (shouldn't happen for DZI tiles).
+      const levelMatch = typeof context.src === 'string' ? context.src.match(/_files\/(\d+)\//) : null;
+      const level = levelMatch ? levelMatch[1] : '?';
+      const tileStart = performance.now();
+      this._logger?.debug?.(`downloading tile level=${level}/${this.maxLevel} (${context.src})`);
+
       this.remoteSziReader.fetchFileBody(context.src, context.userData.abortController.signal).then(
         (arrayBuffer) => {
           const imageBlob = new Blob([arrayBuffer]);
@@ -104,6 +130,9 @@ export const enableSziTileSource = (OpenSeadragon) => {
             resetImageHandlers();
             context.finish(null, null, 'Empty image!');
           } else {
+            this._logger?.debug?.(
+              `tile level=${level} ready: ${(imageBlob.size / 1024).toFixed(1)} KB | ${(performance.now() - tileStart).toFixed(0)} ms`,
+            );
             // Turn the blob into an image,
             // When this completes it will trigger finish via the onLoad method of the image
             image.src = (window.URL || window.webkitURL).createObjectURL(imageBlob);

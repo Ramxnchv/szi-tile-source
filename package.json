@@ -1,6 +1,6 @@
 {
   "name": "@ramxnchv/szi-tile-source",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "An OpenSeadragon TileSource for remotely hosted SZI files",
   "type": "module",
   "files": [

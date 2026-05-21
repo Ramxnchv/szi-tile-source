@@ -27,8 +27,14 @@ export class RemoteFile {
    */
   static create = async (url, fetchOptions = {}, options = {}) => {
     const initialTailSize = options.initialTailSize ?? DEFAULT_INITIAL_TAIL_SIZE;
+    const logger = options.logger ?? null;
+    const t0 = performance.now();
     const { size, tailBuffer, tailStart } = await this.fetchSuffix(url, fetchOptions, initialTailSize);
-    return new RemoteFile(url, size, fetchOptions, { tailBuffer, tailStart });
+    const ms = performance.now() - t0;
+    logger?.info?.(
+      `bootstrap tail prefetch: ${(tailBuffer.byteLength / 1024).toFixed(0)} KB of ${(size / (1024 * 1024)).toFixed(2)} MB total | ${ms.toFixed(0)} ms`,
+    );
+    return new RemoteFile(url, size, fetchOptions, { tailBuffer, tailStart, logger });
   };
 
   /**
@@ -82,6 +88,7 @@ export class RemoteFile {
     this.fetchOptions = fetchOptions;
     this._cachedTail = cache.tailBuffer ?? null;
     this._cachedTailStart = cache.tailStart ?? null;
+    this._logger = cache.logger ?? null;
   }
 
   /**
@@ -113,13 +120,16 @@ export class RemoteFile {
       throw new Error(`Start of fetch range (${start}) greater than end (${end})!`);
     }
 
+    const sizeBytes = end - start;
+
     if (
       this._cachedTail !== null &&
       start >= this._cachedTailStart &&
       end <= this._cachedTailStart + this._cachedTail.byteLength
     ) {
       const offset = start - this._cachedTailStart;
-      return this._cachedTail.slice(offset, offset + (end - start));
+      this._logger?.debug?.(`range ${start}-${end} (${(sizeBytes / 1024).toFixed(1)} KB) | cache hit`);
+      return this._cachedTail.slice(offset, offset + sizeBytes);
     }
 
     const rangeHeaderValue = `bytes=${start}-${end - 1}`;
@@ -127,6 +137,7 @@ export class RemoteFile {
       ? { ...this.fetchOptions.headers, Range: rangeHeaderValue }
       : { Range: rangeHeaderValue };
 
+    const t0 = performance.now();
     const response = await fetch(this.url, {
       headers,
       signal: abortSignal,
@@ -138,7 +149,12 @@ export class RemoteFile {
       throw new Error(`Couldn't fetch range ${start}:${end} of ${this.url} status: ${response.status}`);
     }
 
-    return await response.arrayBuffer();
+    const buffer = await response.arrayBuffer();
+    const ms = performance.now() - t0;
+    this._logger?.debug?.(
+      `range ${start}-${end} (${(sizeBytes / 1024).toFixed(1)} KB) | network ${ms.toFixed(0)} ms`,
+    );
+    return buffer;
   };
 
   /**

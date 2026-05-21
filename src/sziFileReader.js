@@ -398,14 +398,20 @@ export class SziFileReader {
    * @param {RemoteFile} sziFile
    * @returns {Promise<SziFileReader>}
    */
-  static create = async (sziFile) => {
+  static create = async (sziFile, options = {}) => {
+    const logger = options.logger ?? null;
+    const t0 = performance.now();
     const contents = await getContentsOfSziFile(sziFile);
-    return new SziFileReader(sziFile, contents);
+    logger?.info?.(
+      `central directory parsed: ${contents.size} entries | ${(performance.now() - t0).toFixed(0)} ms`,
+    );
+    return new SziFileReader(sziFile, contents, logger);
   };
 
-  constructor(sziFile, contents) {
+  constructor(sziFile, contents, logger = null) {
     this.sziFile = sziFile;
     this.contents = contents;
+    this._logger = logger;
   }
 
   /**

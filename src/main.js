@@ -51,12 +51,14 @@ export const enableSziTileSource = (OpenSeadragon) => {
       logger.info(`reading DZI descriptor: ${remoteSziReader.dziFilename()}`);
       const options = await this.readOptionsFromDziXml(remoteSziReader);
 
-      // Bootstrap (EOCD → Central Directory → .dzi) is done; the tail buffer prefetched
-      // by RemoteFile.create has served its purpose. Free it so we don't pin ~1 MB per
-      // SZI for the lifetime of the viewer when many tile sources are open in parallel.
-      remoteSziFile.releaseCache();
+      // The 1 MB tail prefetched by RemoteFile.create is NOT released here. Overview tiles
+      // (L0–L4 of the DZI pyramid) live at the end of the SZI archive, inside that same
+      // tail window. Keeping the buffer alive lets the first handful of tile fetches resolve
+      // as cache hits instead of issuing fresh Range requests. The buffer is auto-released
+      // inside downloadTileStart once SziTileSource.RELEASE_TAIL_AFTER_TILES tiles have been
+      // served, which is enough to cover the overview band of every common viewport.
 
-      const tileSource = new SziTileSource(remoteSziReader, options, logger);
+      const tileSource = new SziTileSource(remoteSziReader, remoteSziFile, options, logger);
       logger.info(
         `DZI ready: ${options.width}×${options.height}, tileSize=${options.tileSize}, maxLevel=${tileSource.maxLevel} | bootstrap ${(performance.now() - bootstrapStart).toFixed(0)} ms`,
       );
@@ -72,16 +74,29 @@ export const enableSziTileSource = (OpenSeadragon) => {
     }
 
     /**
+     * Number of tile fetches after which the prefetched tail buffer (held by RemoteFile)
+     * is released. Sized to cover the DZI overview band (typically L0–L4 is 1 tile each,
+     * plus a couple of tiles from the first non-overview level) before letting go of the
+     * ~1 MB cache so it does not stay pinned for the lifetime of the viewer.
+     */
+    static RELEASE_TAIL_AFTER_TILES = 8;
+
+    /**
      * Do not call this directly, for internal use only!
      *
      * @param remoteSziReader
+     * @param remoteSziFile underlying RemoteFile, kept so the tail prefetch cache can be
+     *        released once enough overview tiles have been served from it.
      * @param options
      * @param logger optional leveled logger built by createSziTileSource
      */
-    constructor(remoteSziReader, options, logger = null) {
+    constructor(remoteSziReader, remoteSziFile, options, logger = null) {
       super(options);
       this.remoteSziReader = remoteSziReader;
+      this._remoteSziFile = remoteSziFile;
       this._logger = logger;
+      this._tilesServed = 0;
+      this._tailReleased = false;
     }
 
     /**
@@ -133,6 +148,19 @@ export const enableSziTileSource = (OpenSeadragon) => {
             this._logger?.debug?.(
               `tile level=${level} ready: ${(imageBlob.size / 1024).toFixed(1)} KB | ${(performance.now() - tileStart).toFixed(0)} ms`,
             );
+            // Once enough overview tiles have been served (most of which come straight from
+            // the prefetched tail), let the ~1 MB tail cache go so it doesn't stay pinned
+            // for the lifetime of the viewer when many SZIs are open at the same time.
+            this._tilesServed += 1;
+            if (
+              !this._tailReleased &&
+              this._tilesServed >= SziTileSource.RELEASE_TAIL_AFTER_TILES &&
+              this._remoteSziFile
+            ) {
+              this._tailReleased = true;
+              this._remoteSziFile.releaseCache();
+              this._logger?.info?.(`tail cache released after ${this._tilesServed} tiles`);
+            }
             // Turn the blob into an image,
             // When this completes it will trigger finish via the onLoad method of the image
             image.src = (window.URL || window.webkitURL).createObjectURL(imageBlob);
